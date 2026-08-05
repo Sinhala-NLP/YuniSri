@@ -1,10 +1,21 @@
 #!/usr/bin/env python3
 """
-fix_pdf_unicode.py
-==================
+yunisri.fix_pdf_unicode
+=======================
 
 Make a "broken-encoding" PDF (Sinhala / Tamil / etc. that pastes as garbage)
 copy-paste-able, WITHOUT OCR and WITHOUT changing the visual appearance.
+
+Quick start
+-----------
+    import yunisri
+    yunisri.fix_pdf("hansard.pdf")            # -> writes output.pdf
+    yunisri.fix_pdf("hansard.pdf", "clean.pdf")
+
+The reference fonts (Iskoola Pota, Latha, Dinamina, Arial Unicode MS ...) are
+bundled inside the package, so you do NOT pass a fonts directory. The optional
+per-glyph and per-word correction dictionaries (fixes.json / wordfixes.json)
+that ship with the package are applied automatically too.
 
 Why this is needed
 ------------------
@@ -18,9 +29,8 @@ you copy is wrong. Inside the file:
   * `CIDToGIDMap` is Identity (so CID == GID).
 
 => The correct letters survive ONLY as glyph outlines. To recover them without
-   OCR you must match each embedded glyph outline back to a *real* Unicode font
-   (the original Iskoola Pota / Latha / Dinamina, etc.). That exact geometric
-   match is "direct character conversion", not OCR.
+   OCR you must match each embedded glyph outline back to a *real* Unicode font.
+   That exact geometric match is "direct character conversion", not OCR.
 
 How it fixes the file (visuals never change)
 --------------------------------------------
@@ -32,36 +42,62 @@ is byte-for-byte identical. It only:
      marked-content sequence carrying the correct, logically-ordered Unicode
      (fixes vowel-sign REORDERING, which `/ToUnicode` alone cannot do).
 
-Both are proven to leave the raster output unchanged.
-
-Commands
---------
-  analyze  PDF
-      Report the fonts and whether their text extraction looks healthy.
-
-  buildmap PDF --fonts DIR --out map.json
-      NON-OCR recovery. For every embedded subset, match its glyph outlines
-      against reference .ttf/.otf files in DIR (the ORIGINAL fonts, e.g. copied
-      from C:\\Windows\\Fonts), and emit a CID->Unicode map per font.
-
-  apply    PDF --map map.json --out fixed.pdf
-      Rewrite ToUnicode + inject ActualText from the map. Output is copy-paste
-      correct and visually identical.
-
-  selftest PDF
-      Prove the surgery: rewrite/inject with a probe map and confirm the page
-      raster is unchanged.
+CLI
+---
+    yunisri fix       PDF [--out output.pdf]        # one-shot, bundled fonts
+    yunisri analyze   PDF
+    yunisri buildmap  PDF --fonts DIR [--out map.json]
+    yunisri apply     PDF --map map.json [--out fixed.pdf]
+    yunisri selftest  PDF
+    yunisri report    PDF [--map map.json]
+    yunisri diagnose  PDF --page N
 
 Dependencies:  pip install pikepdf fonttools
+(the report/diagnose commands additionally need pillow + freetype-py)
 """
 
-import argparse, json, sys, unicodedata
+import argparse, json, os, sys, unicodedata
+import importlib.resources as _ir
 from collections import defaultdict
 
 import pikepdf
 from pikepdf import Name, String, Dictionary, Operator, ContentStreamInstruction
 
-# ----------------------------------------------------------------------------- 
+# Package name, used to locate bundled fonts/*.json even when this module is run
+# directly as a script (where __package__ is empty).
+_PKG = __package__ or "yunisri"
+
+__all__ = ["fix_pdf", "build_map", "apply_map"]
+
+
+# -----------------------------------------------------------------------------
+# bundled-resource loaders  (fonts folder + fixes/wordfixes are shipped in-pkg)
+# -----------------------------------------------------------------------------
+def _bundled_fonts_dir():
+    """Absolute path to the fonts/ directory shipped inside the package."""
+    return str(_ir.files(_PKG) / "fonts")
+
+def _bundled_json(name):
+    """Load a JSON file shipped inside the package, or None if absent."""
+    try:
+        p = _ir.files(_PKG) / name
+        if p.is_file():
+            return json.loads(p.read_text(encoding="utf-8"))
+    except (FileNotFoundError, ModuleNotFoundError, OSError):
+        pass
+    return None
+
+
+# -----------------------------------------------------------------------------
+# subset-tag stripping ("ABCDEF+IskoolaPota" -> "IskoolaPota")
+# -----------------------------------------------------------------------------
+import re as _re
+_STRIP_SUBSET = _re.compile(r"^[A-Z]{6}\+").sub
+def _fontname(bf):
+    return _STRIP_SUBSET("", str(bf).lstrip("/"))
+
+
+# -----------------------------------------------------------------------------
 # Indic reordering
 # -----------------------------------------------------------------------------
 # In these legacy encodings, the LEFT-side ("pre-base") vowel signs are stored
@@ -311,7 +347,6 @@ def _find_font_files(paths):
 
     Case-insensitive on extension; recurses into directories.
     """
-    import os
     exts = (".ttf", ".otf", ".ttc")
     found = []
     for p in paths:
@@ -328,10 +363,9 @@ def _find_font_files(paths):
             print(f"  (not found: {p})", file=sys.stderr)
     return sorted(set(found))
 
-def _load_reference_fonts(paths):
+def _load_reference_fonts(paths, verbose=True):
     """Load each font file (including every face inside a .ttc)."""
     from fontTools.ttLib import TTFont, TTCollection
-    import os
     refs = []
     files = _find_font_files(paths)
     for path in files:
@@ -347,33 +381,22 @@ def _load_reference_fonts(paths):
                 tag = os.path.basename(path) + (f"#{i}" if len(faces) > 1 else "")
                 refs.append((tag, tt, _reference_signatures(tt),
                              _reverse_cmap(tt), _reverse_gsub(tt)))
-                print(f"  loaded reference: {tag} ({len(tt.getGlyphOrder())} glyphs, "
-                      f"upm={_upm(tt)})")
+                if verbose:
+                    print(f"  loaded reference: {tag} ({len(tt.getGlyphOrder())} glyphs, "
+                          f"upm={_upm(tt)})")
         except Exception as e:
             print(f"  skip {path}: {e}", file=sys.stderr)
     return refs
 
-def cmd_buildmap(args):
+def build_map(pdf, refs, verbose=False):
+    """Match every embedded subset's glyph outlines against reference fonts.
+
+    Returns {basefont_str: {int cid: unicode_str}} for each Type0/Identity-H
+    font. This is the in-memory, no-I/O core behind the `buildmap` command.
+    """
     from fontTools.ttLib import TTFont
     import io
 
-    # --fonts may be given several times and/or point at dirs or single files
-    paths = args.fonts if isinstance(args.fonts, list) else [args.fonts]
-    print(f"Searching for reference fonts in: {', '.join(paths)}")
-    refs = _load_reference_fonts(paths)
-    if not refs:
-        sys.exit(
-            "No usable reference fonts found.\n"
-            "Point --fonts at a folder containing the ORIGINAL .ttf files, e.g.\n"
-            "  Windows: --fonts C:\\Windows\\Fonts\n"
-            "  or copy just the needed ones into a folder:\n"
-            "     iskpota.ttf iskpotab.ttf  (Iskoola Pota / -Bold, Sinhala)\n"
-            "     latha.ttf   lathab.ttf    (Latha, Tamil)\n"
-            "     arialuni.ttf              (Arial Unicode MS)\n"
-            "     the Dinamina .ttf you have\n"
-            "You can pass a whole dir, several dirs, or individual files.")
-
-    pdf = pikepdf.open(args.pdf)
     used = collect_used_cids(pdf)               # {basefont: set(cid)}
     result = {}
 
@@ -416,16 +439,37 @@ def cmd_buildmap(args):
                 if _is_blank_space(sub, gname):
                     uni = " "
             if uni:
-                cid_map[str(cid)] = uni
-        matched = sum(1 for v in cid_map.values() if v.strip())
-        spaces  = sum(1 for v in cid_map.values() if v == " ")
-        total = len(want)
+                cid_map[cid] = uni
+        if verbose:
+            matched = sum(1 for v in cid_map.values() if v.strip())
+            spaces  = sum(1 for v in cid_map.values() if v == " ")
+            total = len(want)
+            print(f"{base[:40]:40} matched {matched}/{total} used glyphs"
+                  + (f"  (+{spaces} spaces)" if spaces else ""))
         result[base] = cid_map
-        print(f"{base[:40]:40} matched {matched}/{total} used glyphs"
-              + (f"  (+{spaces} spaces)" if spaces else ""))
+    return result
 
+def cmd_buildmap(args):
+    paths = args.fonts if isinstance(args.fonts, list) else [args.fonts]
+    print(f"Searching for reference fonts in: {', '.join(paths)}")
+    refs = _load_reference_fonts(paths)
+    if not refs:
+        sys.exit(
+            "No usable reference fonts found.\n"
+            "Point --fonts at a folder containing the ORIGINAL .ttf files, e.g.\n"
+            "  Windows: --fonts C:\\Windows\\Fonts\n"
+            "  or copy just the needed ones into a folder:\n"
+            "     iskpota.ttf iskpotab.ttf  (Iskoola Pota / -Bold, Sinhala)\n"
+            "     latha.ttf   lathab.ttf    (Latha, Tamil)\n"
+            "     arialuni.ttf              (Arial Unicode MS)\n"
+            "     the Dinamina .ttf you have\n"
+            "You can pass a whole dir, several dirs, or individual files.")
+
+    pdf = pikepdf.open(args.pdf)
+    result = build_map(pdf, refs, verbose=True)
+    out = {base: {str(k): v for k, v in m.items()} for base, m in result.items()}
     with open(args.out, "w", encoding="utf-8") as fh:
-        json.dump(result, fh, ensure_ascii=False, indent=1)
+        json.dump(out, fh, ensure_ascii=False, indent=1)
     print(f"\nWrote {args.out}. Any remaining unmatched glyphs are display-only "
           "\nvariants; add the exact font version or hand-edit map.json to fix them.")
 
@@ -482,38 +526,30 @@ def _has_indic(cid_map):
                 return True
     return False
 
-def cmd_apply(args):
-    import re as _re
-    _strip = _re.compile(r"^[A-Z]{6}\+").sub
-    def _fontname(bf):
-        return _strip("", str(bf).lstrip("/"))
+def apply_map(pdf, fmap, fixes=None, wordfixes=None,
+              sinhala_fix=True, actualtext=True, verbose=False):
+    """Rewrite ToUnicode + inject ActualText into an open pikepdf, in place.
 
-    with open(args.map, encoding="utf-8") as fh:
-        raw = json.load(fh)
+    `fmap`      : {basefont: {cid(int|str): unicode}}   (from build_map)
+    `fixes`     : optional {fontkey: {cid: unicode}} hand-fix overrides.
+                  Keys may be bare names ("IskoolaPota") or full "SUBSET+Name";
+                  both normalise to the bare name so ONE fixes.json works across
+                  documents (subset tags differ per file, glyph CIDs are stable).
+    `wordfixes` : optional {broken_word: correct_word} whole-word overrides.
+    """
     # normalise map: {basefont: {int cid: str}}
-    fmap = {base: {int(k): v for k, v in m.items()} for base, m in raw.items()}
+    fmap = {base: {int(k): v for k, v in m.items()} for base, m in fmap.items()}
 
-    pdf = pikepdf.open(args.pdf)
-
-    # merge hand-fix overrides. Keys may be a bare font name ("IskoolaPota") or a
-    # full "SUBSET+Name" BaseFont; both are normalised to the bare name so ONE
-    # fixes.json works across documents (subset tags differ per file, but the
-    # font name and the glyph CIDs are stable).
-    if args.fixes:
-        with open(args.fixes, encoding="utf-8") as fh:
-            fx = json.load(fh)
+    # merge hand-fix overrides (by normalised font name)
+    if fixes:
         by_name = {}
-        for key, m in fx.items():
+        for key, m in fixes.items():
             by_name.setdefault(_fontname(key), {}).update({int(k): v for k, v in m.items()})
         for base, f in iter_font_objects(pdf):
             if font_is_type0_identity(f) and _fontname(base) in by_name:
                 fmap.setdefault(base, {}).update(by_name[_fontname(base)])
 
-    # optional whole-word corrections for the residual legacy-vowel cases
-    wordfixes = {}
-    if args.wordfixes:
-        with open(args.wordfixes, encoding="utf-8") as fh:
-            wordfixes = json.load(fh)
+    wordfixes = wordfixes or {}
 
     # Only remap fonts that actually carry Indic script. Latin/symbol fonts
     # (Times, Calibri, Symbol, ...) already have a correct ToUnicode, so leaving
@@ -521,7 +557,7 @@ def cmd_apply(args):
     skipped = [b for b, m in fmap.items() if not _has_indic(m)]
     for b in skipped:
         del fmap[b]
-    if skipped:
+    if skipped and verbose:
         print(f"Left {len(skipped)} non-Indic font(s) untouched (their original "
               f"text layer is already correct).")
 
@@ -531,13 +567,31 @@ def cmd_apply(args):
             f["/ToUnicode"] = build_tounicode_stream(pdf, fmap[base])
 
     # 2) inject ActualText per text-show (fixes ordering; primary path)
-    if not args.no_actualtext:
+    if actualtext:
         for page in pdf.pages:
-            _inject_actualtext_page(page, fmap, wordfixes,
-                                    sinhala_fix=not args.no_sinhala_heuristics)
+            _inject_actualtext_page(page, fmap, wordfixes, sinhala_fix=sinhala_fix)
 
+def cmd_apply(args):
+    with open(args.map, encoding="utf-8") as fh:
+        fmap = json.load(fh)
+
+    fixes = None
+    if args.fixes:
+        with open(args.fixes, encoding="utf-8") as fh:
+            fixes = json.load(fh)
+
+    wordfixes = None
+    if args.wordfixes:
+        with open(args.wordfixes, encoding="utf-8") as fh:
+            wordfixes = json.load(fh)
+
+    pdf = pikepdf.open(args.pdf)
+    apply_map(pdf, fmap, fixes=fixes, wordfixes=wordfixes,
+              sinhala_fix=not args.no_sinhala_heuristics,
+              actualtext=not args.no_actualtext, verbose=True)
     pdf.save(args.out)
     print(f"Wrote {args.out}  (visuals identical; text now copy-paste correct)")
+
 
 _SINH_TAM_WORD = None
 # --- Sinhala legacy split-vowel repair (fixes the ේ/ෝ scramble generically) ---
@@ -647,10 +701,85 @@ def _run_text_with_spaces(instr, op, m):
 
 
 # -----------------------------------------------------------------------------
+# PUBLIC API  --  the one call most users need
+# -----------------------------------------------------------------------------
+def fix_pdf(input_pdf, output_pdf="output.pdf", *,
+            fonts_dir=None, fixes="bundled", wordfixes="bundled",
+            sinhala_heuristics=True, actualtext=True, verbose=False):
+    """Recover copy-paste-correct text in a broken-encoding Sri-Lankan PDF.
+
+    Reads `input_pdf`, matches each embedded glyph outline against the bundled
+    reference fonts, rewrites ToUnicode + injects ActualText, and writes
+    `output_pdf`. The rendered pages are unchanged; only the invisible text
+    layer is corrected.
+
+    Parameters
+    ----------
+    input_pdf   : path to the source PDF.
+    output_pdf  : where to write the fixed PDF (default "output.pdf").
+    fonts_dir   : override the bundled reference fonts. Accepts a directory,
+                  a list of dirs/files, or None (use the packaged fonts/).
+    fixes       : per-glyph override dict, a path to a JSON file, "bundled"
+                  (use the packaged fixes.json, the default), or None.
+    wordfixes   : whole-word override dict, a path to a JSON file, "bundled"
+                  (use the packaged wordfixes.json, the default), or None.
+    sinhala_heuristics : apply the generic Sinhala split-vowel repair (default True).
+    actualtext  : inject ActualText for reordering (default True). If False,
+                  only ToUnicode is rewritten.
+    verbose     : print per-font match statistics.
+
+    Returns
+    -------
+    The path to the written output PDF.
+    """
+    # resolve reference fonts
+    if fonts_dir is None:
+        paths = [_bundled_fonts_dir()]
+    elif isinstance(fonts_dir, (list, tuple)):
+        paths = list(fonts_dir)
+    else:
+        paths = [fonts_dir]
+    refs = _load_reference_fonts(paths, verbose=verbose)
+    if not refs:
+        raise RuntimeError(
+            f"No usable reference fonts found in {paths!r}. "
+            "Ensure the package's fonts/ folder is installed, or pass fonts_dir=.")
+
+    # resolve fixes / wordfixes (dict | path | "bundled" | None)
+    fixes = _resolve_corrections(fixes, "fixes.json")
+    wordfixes = _resolve_corrections(wordfixes, "wordfixes.json")
+
+    pdf = pikepdf.open(input_pdf)
+    fmap = build_map(pdf, refs, verbose=verbose)
+    apply_map(pdf, fmap, fixes=fixes, wordfixes=wordfixes,
+              sinhala_fix=sinhala_heuristics, actualtext=actualtext, verbose=verbose)
+    pdf.save(output_pdf)
+    return output_pdf
+
+def _resolve_corrections(value, bundled_name):
+    """Turn a dict / path / 'bundled' / None into a dict (or None)."""
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return value
+    if value == "bundled":
+        return _bundled_json(bundled_name)
+    # otherwise treat as a filesystem path
+    with open(value, encoding="utf-8") as fh:
+        return json.load(fh)
+
+def cmd_fix(args):
+    out = fix_pdf(args.pdf, args.out,
+                  fonts_dir=(args.fonts if args.fonts else None),
+                  verbose=True)
+    print(f"Wrote {out}  (visuals identical; text now copy-paste correct)")
+
+
+# -----------------------------------------------------------------------------
 # diagnose  (per-run glyph strips + current decoded text, to pinpoint bad CIDs)
 # -----------------------------------------------------------------------------
 def cmd_diagnose(args):
-    import io, base64, tempfile, freetype, os
+    import io, base64, tempfile, freetype
     from PIL import Image, ImageOps
     fmap = {}
     for src in (args.map, args.fixes):
@@ -753,8 +882,7 @@ def _render_glyph_b64(face, gid, px=44):
     return base64.b64encode(buf.getvalue()).decode()
 
 def cmd_report(args):
-    import io, tempfile, os, freetype
-    from fontTools.ttLib import TTFont
+    import tempfile, freetype
     fmap = {}
     if args.map and os.path.exists(args.map):
         raw = json.load(open(args.map, encoding="utf-8"))
@@ -810,7 +938,7 @@ def cmd_report(args):
 # selftest  (mechanism proof on the real file)
 # -----------------------------------------------------------------------------
 def cmd_selftest(args):
-    import hashlib, subprocess, tempfile, os
+    import hashlib, subprocess, tempfile
     pdf = pikepdf.open(args.pdf)
     # probe: map first used cid of first Type0 font to a marker string
     used = collect_used_cids(pdf)
@@ -843,10 +971,18 @@ def cmd_selftest(args):
 
 
 # -----------------------------------------------------------------------------
-def main():
-    ap = argparse.ArgumentParser(description=__doc__,
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="yunisri", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
+
+    # one-shot, bundled fonts -> output.pdf
+    fx = sub.add_parser("fix", help="recover text using the bundled fonts -> output.pdf")
+    fx.add_argument("pdf")
+    fx.add_argument("--out", default="output.pdf")
+    fx.add_argument("--fonts", nargs="+", default=None,
+                    help="override the bundled reference fonts (dir(s)/file(s))")
+    fx.set_defaults(fn=cmd_fix)
 
     a = sub.add_parser("analyze"); a.add_argument("pdf"); a.set_defaults(fn=cmd_analyze)
 
@@ -879,7 +1015,7 @@ def main():
     dg.add_argument("--out", default="diagnose.html")
     dg.set_defaults(fn=cmd_diagnose)
 
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
     args.fn(args)
 
 if __name__ == "__main__":

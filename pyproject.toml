@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "yunisri"
+version = "0.1.0"
+description = "Make broken-encoding Sri-Lankan (Sinhala/Tamil) PDFs copy-paste-able without OCR, without changing their appearance."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Tharindu Ranasinghe", email = "rhtdranasinghe@gmail.com" }]
+keywords = ["pdf", "sinhala", "tamil", "unicode", "hansard", "ocr", "tounicode", "actualtext"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Text Processing :: Fonts",
+]
+dependencies = [
+    "pikepdf>=8",
+    "fonttools>=4.40",
+]
+
+# Only needed for the visual `report` / `diagnose` diagnostic commands.
+[project.optional-dependencies]
+diagnostics = ["pillow>=9", "freetype-py>=2.3"]
+
+[project.scripts]
+yunisri = "yunisri.fix_pdf_unicode:main"
+
+[project.urls]
+Homepage = "https://github.com/sinhala-nlp/yunisri"
+Issues = "https://github.com/sinhala-nlp/issues"
+
+[tool.setuptools.packages.find]
+include = ["yunisri*"]
+
+# Ship the reference fonts and the correction dictionaries inside the wheel.
+[tool.setuptools.package-data]
+"yunisri" = ["*.json"]
+"yunisri.fonts" = ["*.ttf", "*.TTF", "*.otf", "*.OTF", "*.ttc", "*.TTC"]
