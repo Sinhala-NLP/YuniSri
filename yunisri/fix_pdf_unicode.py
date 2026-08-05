@@ -67,7 +67,12 @@ from pikepdf import Name, String, Dictionary, Operator, ContentStreamInstruction
 # directly as a script (where __package__ is empty).
 _PKG = __package__ or "yunisri"
 
-__all__ = ["fix_pdf", "build_map", "apply_map"]
+try:                               # legacy FM/DL simple-font recovery (mode 2)
+    from . import legacy as _legacy
+except ImportError:                # running as a bare script
+    import legacy as _legacy
+
+__all__ = ["fix_pdf", "build_map", "apply_map", "apply_legacy"]
 
 
 # -----------------------------------------------------------------------------
@@ -179,6 +184,28 @@ def build_tounicode_stream(pdf, cid_to_uni):
     L += ["endcmap", "CMapName currentdict /CMap defineresource pop", "end", "end"]
     return pdf.make_stream("\n".join(L).encode("latin-1"))
 
+def build_tounicode_stream_simple(pdf, byte_to_uni):
+    """/ToUnicode CMap for a SIMPLE (1-byte code) font: {int code: str}.
+
+    Used for legacy FM/DL fonts. This gives per-glyph copy in visual order for
+    tools that ignore ActualText; the injected ActualText carries the correctly
+    reordered text and is the primary fix.
+    """
+    L = ["/CIDInit /ProcSet findresource begin", "12 dict begin", "begincmap",
+         "/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def",
+         "/CMapName /Adobe-Identity-UCS def", "/CMapType 2 def",
+         "1 begincodespacerange", "<00> <FF>", "endcodespacerange"]
+    items = sorted(byte_to_uni.items())
+    for k in range(0, len(items), 100):
+        chunk = items[k:k + 100]
+        L.append(f"{len(chunk)} beginbfchar")
+        for code, u in chunk:
+            hexu = "".join(f"{ord(c):04X}" for c in u) or "FFFD"
+            L.append(f"<{code:02X}> <{hexu}>")
+        L.append("endbfchar")
+    L += ["endcmap", "CMapName currentdict /CMap defineresource pop", "end", "end"]
+    return pdf.make_stream("\n".join(L).encode("latin-1"))
+
 
 # -----------------------------------------------------------------------------
 # Font inventory
@@ -214,17 +241,32 @@ def font_is_type0_identity(f):
 def cmd_analyze(args):
     pdf = pikepdf.open(args.pdf)
     print(f"{args.pdf}: {len(pdf.pages)} pages\n")
-    print(f"{'BaseFont':38} {'Subtype':16} {'Enc':12} {'ToUni':6}")
-    print("-" * 74)
+    print(f"{'BaseFont':38} {'Subtype':16} {'Enc':12} {'ToUni':6} {'Mode':10}")
+    print("-" * 86)
+    n_type0 = n_legacy = 0
     for base, f in iter_font_objects(pdf):
         sub = str(f.get("/Subtype", ""))
         enc = f.get("/Encoding")
         enc = str(enc) if isinstance(enc, (pikepdf.Name, str)) else (
               str(enc.get("/BaseEncoding", "dict")) if isinstance(enc, pikepdf.Dictionary) else str(enc))
         tu = "yes" if "/ToUnicode" in f else "NO"
-        print(f"{base[:38]:38} {sub[:16]:16} {enc[:12]:12} {tu:6}")
-    print("\nNote: a present ToUnicode does NOT mean it is correct. Legacy Hansard "
-          "\nfonts ship a corrupt one; use buildmap+apply with the original fonts.")
+        if font_is_type0_identity(f):
+            mode = "1:outline"; n_type0 += 1
+        elif font_is_legacy_simple(f):
+            mode = "2:legacy"; n_legacy += 1
+        else:
+            mode = "-"
+        print(f"{base[:38]:38} {sub[:16]:16} {enc[:12]:12} {tu:6} {mode:10}")
+    print()
+    if n_type0:
+        print(f"  mode 1 (Type0/Identity-H outline recovery): {n_type0} font(s)")
+    if n_legacy:
+        print(f"  mode 2 (legacy FM/DL transliteration):       {n_legacy} font(s)")
+    if not (n_type0 or n_legacy):
+        print("  no recoverable Sinhala/Tamil fonts detected.")
+    print("\nNote: a present ToUnicode does NOT mean it is correct. Both a corrupt "
+          "\nHansard ToUnicode and a legacy WinAnsi one copy as garbage; fix_pdf "
+          "\nhandles whichever mode(s) apply.")
 
 
 # -----------------------------------------------------------------------------
@@ -701,17 +743,150 @@ def _run_text_with_spaces(instr, op, m):
 
 
 # -----------------------------------------------------------------------------
+# LEGACY FM/DL simple-font recovery   (recovery mode 2)
+# -----------------------------------------------------------------------------
+# The other common broken-Sinhala PDF: simple 1-byte TrueType/Type1 fonts
+# (FMAbhaya, FMSamantha, DL-*, ...) that store Sinhala as Latin bytes. No
+# outline puzzle -- the bytes ARE the letters in a fixed legacy layout, so
+# recovery is transliteration (see legacy.py) rather than outline matching.
+import re as _re_leg
+_strip_subset_leg = _re_leg.compile(r"^[A-Z]{6}\+").sub
+def _legacy_fontname(b):
+    return _strip_subset_leg("", str(b).lstrip("/"))
+
+def font_is_legacy_simple(f):
+    """True if f is a simple (1-byte) TrueType/Type1 legacy Sinhala font."""
+    if str(f.get("/Subtype")) not in ("/TrueType", "/Type1"):
+        return False
+    return _legacy.basefont_is_legacy(f.get("/BaseFont", ""))
+
+def _legacy_decode(b):
+    """Show-operand bytes of a simple font -> the legacy (Latin) string."""
+    try:
+        return b.decode("cp1252")
+    except Exception:
+        return b.decode("latin-1", "replace")
+
+def _legacy_run_text(instr, op):
+    """A show op's legacy text, inserting spaces for big TJ inter-word gaps."""
+    parts = []
+    if op == "Tj":
+        parts.append(_legacy_decode(bytes(instr.operands[0])))
+    else:
+        for el in instr.operands[0]:
+            if isinstance(el, pikepdf.String):
+                parts.append(_legacy_decode(bytes(el)))
+            elif float(el) < -_GAP_THOUSANDTHS:
+                parts.append(" ")
+    return "".join(parts)
+
+def collect_used_bytes_legacy(pdf):
+    """{basefont: set(int code)} actually shown by each legacy simple font."""
+    used = defaultdict(set)
+    for page in pdf.pages:
+        res = page.get("/Resources"); fonts = (res or {}).get("/Font", {})
+        nb = {str(n): str(ff.get("/BaseFont", "")) for n, ff in
+              (fonts.items() if fonts else [])}
+        leg = {str(n): font_is_legacy_simple(ff) for n, ff in
+               (fonts.items() if fonts else [])}
+        cur = None
+        try:
+            ops = list(pikepdf.parse_content_stream(page))
+        except Exception:
+            continue
+        for instr in ops:
+            o = str(instr.operator)
+            if o == "Tf":
+                cur = str(instr.operands[0])
+            elif o in ("Tj", "TJ") and leg.get(cur):
+                for ch in _legacy_run_text(instr, o):
+                    if ord(ch) < 256:
+                        used[nb[cur]].add(ord(ch))
+    return used
+
+def _inject_actualtext_legacy_page(page, legacy_bases, overrides=None, wordfixes=None):
+    res = page.get("/Resources"); fonts = (res or {}).get("/Font", {})
+    nb = {str(n): str(ff.get("/BaseFont", "")) for n, ff in
+          (fonts.items() if fonts else [])}
+    leg = {str(n): font_is_legacy_simple(ff) for n, ff in
+           (fonts.items() if fonts else [])}
+    try:
+        ops = list(pikepdf.parse_content_stream(page))
+    except Exception:
+        return
+    cur = None; out = []; changed = False
+    for instr in ops:
+        o = str(instr.operator)
+        if o == "Tf":
+            cur = str(instr.operands[0]); out.append(instr); continue
+        if o in ("Tj", "TJ") and leg.get(cur) and nb.get(cur) in legacy_bases:
+            legacy = _legacy_run_text(instr, o)
+            text = _legacy.transliterate(legacy, overrides)
+            text = _apply_wordfixes(text, wordfixes)
+            if text and text != legacy:
+                props = Dictionary(ActualText=String(text))
+                out.append(ContentStreamInstruction([Name("/Span"), props], Operator("BDC")))
+                out.append(instr)
+                out.append(ContentStreamInstruction([], Operator("EMC")))
+                changed = True; continue
+        out.append(instr)
+    if changed:
+        page.Contents.write(pikepdf.unparse_content_stream(out))
+
+def apply_legacy(pdf, overrides=None, wordfixes=None, actualtext=True, verbose=False):
+    """Recover text from legacy FM/DL simple fonts, in place. Returns the number
+    of legacy fonts handled (0 if the PDF has none). Non-legacy fonts (real
+    Latin fonts, Type0 fonts) are left completely untouched.
+    """
+    legacy_bases = {b for b, f in iter_font_objects(pdf) if font_is_legacy_simple(f)}
+    if not legacy_bases:
+        return 0
+    if verbose:
+        print("Legacy FM/DL fonts: "
+              + ", ".join(sorted(_legacy_fontname(b) for b in legacy_bases)))
+
+    # 1) per-glyph ToUnicode (visual order) so even ActualText-unaware tools improve
+    used = collect_used_bytes_legacy(pdf)
+    for base, f in iter_font_objects(pdf):
+        if base not in legacy_bases:
+            continue
+        codes = used.get(base, set(range(32, 256)))
+        b2u = {}
+        for code in codes:
+            ch = bytes([code]).decode("cp1252", "replace")
+            u = _legacy.transliterate(ch, overrides)      # per-glyph, no reorder
+            if u and u != ch:
+                b2u[code] = u
+        if b2u:
+            f["/ToUnicode"] = build_tounicode_stream_simple(pdf, b2u)
+
+    # 2) ActualText per run -- the primary fix (correct, reordered text)
+    if actualtext:
+        for page in pdf.pages:
+            _inject_actualtext_legacy_page(page, legacy_bases, overrides, wordfixes)
+    return len(legacy_bases)
+
+
+# -----------------------------------------------------------------------------
 # PUBLIC API  --  the one call most users need
 # -----------------------------------------------------------------------------
 def fix_pdf(input_pdf, output_pdf="output.pdf", *,
             fonts_dir=None, fixes="bundled", wordfixes="bundled",
+            legacy_fixes="bundled",
             sinhala_heuristics=True, actualtext=True, verbose=False):
     """Recover copy-paste-correct text in a broken-encoding Sri-Lankan PDF.
 
-    Reads `input_pdf`, matches each embedded glyph outline against the bundled
-    reference fonts, rewrites ToUnicode + injects ActualText, and writes
-    `output_pdf`. The rendered pages are unchanged; only the invisible text
-    layer is corrected.
+    Handles both common failure modes automatically, in one pass:
+      * mode 1 (Type0/Identity-H, "Hansard-style"): subsetted fonts with corrupt
+        ToUnicode where the correct letters survive only as glyph outlines --
+        recovered by matching outlines against the bundled reference fonts;
+      * mode 2 (legacy FM/DL simple fonts): FMAbhaya/FMSamantha/DL-* embedded as
+        simple TrueType/Type1 fonts that store Sinhala as Latin bytes -- recovered
+        by transliteration (see legacy.py).
+
+    Whichever modes apply to the file are run; the rendered pages are unchanged,
+    only the invisible text layer is corrected. A file with neither kind of font
+    is written back unchanged.
 
     Parameters
     ----------
@@ -723,6 +898,10 @@ def fix_pdf(input_pdf, output_pdf="output.pdf", *,
                   (use the packaged fixes.json, the default), or None.
     wordfixes   : whole-word override dict, a path to a JSON file, "bundled"
                   (use the packaged wordfixes.json, the default), or None.
+    legacy_fixes : extra legacy-sequence -> Unicode overrides for mode 2, as a
+                  dict, a JSON path, "bundled" (packaged legacy_fixes.json if
+                  present, else ignored), or None. Use this to add font-specific
+                  FM ligatures the built-in table doesn't know yet.
     sinhala_heuristics : apply the generic Sinhala split-vowel repair (default True).
     actualtext  : inject ActualText for reordering (default True). If False,
                   only ToUnicode is rewritten.
@@ -732,27 +911,40 @@ def fix_pdf(input_pdf, output_pdf="output.pdf", *,
     -------
     The path to the written output PDF.
     """
-    # resolve reference fonts
-    if fonts_dir is None:
-        paths = [_bundled_fonts_dir()]
-    elif isinstance(fonts_dir, (list, tuple)):
-        paths = list(fonts_dir)
-    else:
-        paths = [fonts_dir]
-    refs = _load_reference_fonts(paths, verbose=verbose)
-    if not refs:
-        raise RuntimeError(
-            f"No usable reference fonts found in {paths!r}. "
-            "Ensure the package's fonts/ folder is installed, or pass fonts_dir=.")
-
-    # resolve fixes / wordfixes (dict | path | "bundled" | None)
+    # resolve correction dictionaries once (dict | path | "bundled" | None)
     fixes = _resolve_corrections(fixes, "fixes.json")
     wordfixes = _resolve_corrections(wordfixes, "wordfixes.json")
+    legacy_overrides = _resolve_corrections(legacy_fixes, "legacy_fixes.json")
 
     pdf = pikepdf.open(input_pdf)
-    fmap = build_map(pdf, refs, verbose=verbose)
-    apply_map(pdf, fmap, fixes=fixes, wordfixes=wordfixes,
-              sinhala_fix=sinhala_heuristics, actualtext=actualtext, verbose=verbose)
+
+    # --- mode 1: Type0 / Identity-H outline recovery (Hansard-style) ----------
+    # Only load reference fonts if the file actually has such fonts, so a purely
+    # legacy-font PDF doesn't need them.
+    has_type0 = any(font_is_type0_identity(f) for _, f in iter_font_objects(pdf))
+    if has_type0:
+        if fonts_dir is None:
+            paths = [_bundled_fonts_dir()]
+        elif isinstance(fonts_dir, (list, tuple)):
+            paths = list(fonts_dir)
+        else:
+            paths = [fonts_dir]
+        refs = _load_reference_fonts(paths, verbose=verbose)
+        if not refs:
+            raise RuntimeError(
+                f"No usable reference fonts found in {paths!r}. "
+                "Ensure the package's fonts/ folder is installed, or pass fonts_dir=.")
+        fmap = build_map(pdf, refs, verbose=verbose)
+        apply_map(pdf, fmap, fixes=fixes, wordfixes=wordfixes,
+                  sinhala_fix=sinhala_heuristics, actualtext=actualtext, verbose=verbose)
+
+    # --- mode 2: legacy FM/DL simple-font recovery ----------------------------
+    n_legacy = apply_legacy(pdf, overrides=legacy_overrides, wordfixes=wordfixes,
+                            actualtext=actualtext, verbose=verbose)
+
+    if verbose and not has_type0 and not n_legacy:
+        print("No recoverable Sinhala/Tamil fonts found; output equals input.")
+
     pdf.save(output_pdf)
     return output_pdf
 
