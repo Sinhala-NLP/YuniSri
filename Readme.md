@@ -1,6 +1,10 @@
-# yunisri
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0) 
+[![PyPI version](https://img.shields.io/pypi/v/yunisri?color=%236ecfbd&label=pypi%20package&style=flat-square)](https://pypi.org/project/yunisri/)
+[![Downloads](https://pepy.tech/badge/yunisri)](https://pepy.tech/project/yunisri)
 
-Make broken-encoding Sri-Lankan (Sinhala / Tamil) PDFs — e.g. Hansard — **copy-paste-able
+# YuniSri
+
+Make broken-encoding Sri-Lankan (Sinhala / Tamil) PDFs (e.g. Hansard) **copy-paste-able
 without changing how the pages look**.
 
 Many Sri-Lankan government PDFs embed subsetted legacy fonts with a corrupt
