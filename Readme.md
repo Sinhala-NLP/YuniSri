@@ -4,7 +4,7 @@
 
 # YuniSri
 
-Make broken-encoding Sri-Lankan (Sinhala / Tamil) PDFs (e.g. Hansard) **copy-paste-able
+Make broken-encoding SriLankan (Sinhala / Tamil) PDFs (e.g. Hansard) **copy-paste-able
 without changing how the pages look**.
 
 Many Sri-Lankan government PDFs embed subsetted legacy fonts with a corrupt
