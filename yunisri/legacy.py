@@ -92,7 +92,7 @@ FM_MAP = {
     "s": "ි", "S": "ී",
     "q": "\u0dd4", "Q": "\u0dd6",   # ු  ූ
     "D": "\u0dd8",                    # ෘ
-    "e": "ැ", "E": "ෑ",
+    "e": "ැ", "E": "\u0dd6",
 
     # ---- pre-base vowel signs (moved by reorder) ----
     "f": "ෙ",          # ෙ (also the front half of ො / ේ / ෝ)
@@ -139,6 +139,73 @@ FM_MAP.update({
     "\u00ea": "ධ\u0dd2",           # ê  -> ධි   (බුද්ධිය)
     ">":      "ඝ",                 # >  -> ඝ    (ශීඝ්‍ර)
     "\u00ed": "බ",                 # í  -> බ    (තිබේ)
+    "\u00a7": "ද\u0dd3",           # §  -> දී   (මෙහිදී, අනාගතයේදී)
+    "\u00dc": "ට\u0dca",           # Ü  -> ට්   (කොම්පෝස්ට්)
+})
+
+# ---------------------------------------------------------------------------
+# Full-book QA pass: high-frequency consonant+vowel ligature bytes and a few
+# modifier/punctuation bytes, each confirmed against real textbook content
+# (the word in the comment). Values are single syllables (no reorder needed).
+# ---------------------------------------------------------------------------
+AU = "\ue001"   # second deergha: completes ෙ->ෞ, උ->ඌ (distinct from DEERGHA)
+
+FM_MAP.update({
+    # consonant + i / ii / u / aa precomposed forms
+    "\u00a2": "\u0db3\u0dd2",       # ¢  -> ඳි   (හැඳින්වේ, හොඳින්)
+    "\u00de": "දා",                # Þ  -> දා   (බෙදාහැරීම)
+    "\u00cd": "ර\u0dd3",           # Í  -> රී   (කිරීම, නිරීක්ෂණ, හැරීම)
+    "\u00ec": "බ\u0dd2",           # ì  -> බි   (බිහි, බිත්ති)
+    "\u00ee": "බ\u0dd3",           # î  -> බී   (බීජ, බීජාණු)
+    "\u00d4": "ජ\u0dd3",           # Ô  -> ජී   (ජීවීන්, ජීව, ජීවිත)
+    "\u00d3": "ථ\u0dd2",           # Ó  -> ථි   (ආර්ථික, ග්‍රන්ථි, කථිකාචාර්ය)
+    "\u00d2": "ථ\u0dd2",           # Ò  -> ථි   (පෘථිවි)
+    "\u00d1": "ච\u0dd2",           # Ñ  -> චි   (චින්තක, චිම්පන්සියා)
+    "\u00f7": "\u0db3\u0dd4",       # ÷  -> ඳු   (හඳුනා, වඳුරා)
+    "\u00c6": "ල\u0dd6",           # Æ  -> ලූ   (ලූනු)
+    "\u00a5": "ද\u0dd6",           # ¥  -> දූ   (දූෂක, දූෂණය)
+    "\u00e2": "ඩ\u0dca",           # â  -> ඩ්   (ඔක්සයිඩ්, හයිඩ්‍රොක්සයිඩ්)
+    "\u00e4": "ඩ\u0dd2",           # ä  -> ඩි   (වැඩි, සෝඩියම, ඩිම්බ)
+    "\u00e1": "ට\u0dd2",           # á  -> ටි   (සිටින, ඝටිකාව, යටිකුරු)
+    "\u00e0": "ට\u0dd3",           # à  -> ටී   (පිහිටීම)
+    "\u00e8": "ධ\u0dca",           # è  -> ධ්   (ධ්වනි)
+    "\u00f0": "ජ\u0dd2",           # ð  -> ජි   (සමාජික, ඉංජිනේරු)
+    "\u00f3": "ම\u0dd3",           # ó  -> මී   (මීටර, මීයා, මහත්මීන්)
+    "\u00eb": "ධ\u0dd3",           # ë  -> ධී   (අධීක්ෂණ, සම්බන්ධීකරණ)
+    "\u00ca": "ජ\u0dca",           # Ê  -> ජ්   (විරාජ්, රජ්ජු)
+    "\u00c9": "ච\u0dca",           # É  -> ච්   (විච්ඡේදනය, එච්)
+    "\u00fe": "\u0da1",            # þ  -> ඡ    (විච්ඡේදනය)
+    "\u0152": "\u0dab\u0dd3",       # Œ  -> ණී   (පැමිණීම)
+
+    # independent-vowel / conjunct-forming bytes
+    "\u00b1": "ද\u0dd0",           # ±  -> දැ   (දැක්වේ, දැනුම)
+    "\u00b4": "\u0d95",            # ´  -> ඕ    (ඕනෑම, ඕකිඩ්)
+    "{":      "\u0d9e",            # {  -> ඥ    (ඥාන, විද්‍යාඥ)
+    "C":      "ක\u0dca",           # C  -> ක්   (ලක්ෂණ, නිරීක්ෂණ)  [FM runs only]
+    "Z":      "ර\u0dca",           # Z  -> ර්   (පර්මැංගනේට්)
+    "U":      "\u0db9",            # U  -> ඹ    (කොළඹ, අඹ)
+
+    # modifier bytes (sentinels resolved in _fm_reorder)
+    "A":      DEERGHA,             # A  -> deergha (ඒ from එ, hal ්)  [FM runs]
+    "!":      AU,                  # !  -> au deergha (ෞ from ෙ, ඌ from උ)
+
+    # backtick (0x60) + consonant = prenasalised consonant
+    "`.":     "\u0da5",            # `ග -> ඟ    (සමඟ)
+    "`v":     "\u0dac",            # `ඩ -> ඬ    (අඬු)
+    "`o":     "\u0db3",            # `ද -> ඳ    (රඳා)
+    "`\u00a7":"\u0db3\u0dd3",       # `§ -> ඳී   (බැඳීම)
+    "`\u00a3":"\u0db3\u0dd3",       # `£ -> ඳී   (බැඳීම)
+
+    # punctuation (within FM runs)
+    "'":      ".",                 # '  -> full stop
+    "\"":     ",",                 # "  -> comma
+    "\u00ac": " + ",               # ¬  -> +    (chemistry: A ¬ B)
+    "\u00a4": " - ",               # ¤  -> figure-caption dash
+    "\u00a1": " - ",               # ¡  -> figure-caption dash
+    "\u00ab": " \u00d7 ",          # «  -> ×    (multiplication)
+    "\u00e3": "ඩ",                 # ã  -> ඩ    (name initial "D")
+    "\u00e6": "!",                 # æ  -> !    (වේවා!)
+    "+":      "\u0dd6",            # +  -> ූ    (අනුකූල, භූගත, කූප)  [FM runs]
 })
 
 
@@ -197,19 +264,32 @@ def _fm_reorder(text):
     text = _re.sub("\u0dd9" + C + "\u0dcf", lambda m: m.group(1) + "\u0ddc", text)
     #    ො + deergha  -> ෝ
     text = text.replace("\u0ddc" + DEERGHA, "\u0ddd")
-    #    ෙ C DEERGHA  -> C ේ
+    #    ෙ C AU       -> C ෞ   (the au-sign, e.g. භෞතික, ගෞර, පෞරුෂ)
+    text = _re.sub("\u0dd9" + C + AU, lambda m: m.group(1) + "\u0dde", text)
+    #    ෙ C DEERGHA  -> C ේ   (deergha immediately after the cluster = long e)
     text = _re.sub("\u0dd9" + C + DEERGHA, lambda m: m.group(1) + "\u0dda", text)
-    #    ෙ C1 C2 DEERGHA -> C1 ේ C2 ්   (long-e on first consonant, hal on the
-    #    next; e.g. …මේන්…, …තේන්…, where the deergha lands past the intervening
-    #    consonant in legacy order)
-    text = _re.sub("\u0dd9" + C + C + DEERGHA,
-                   lambda m: m.group(1) + "\u0dda" + m.group(2) + "\u0dca", text)
-    #    ෙ C          -> C ෙ   (plain e)
+    #    ෙ C          -> C ෙ   (plain e). When another consonant follows before
+    #    the deergha (e.g. …යෙන්, …වෙන්), the e stays SHORT and the deergha is
+    #    the following consonant's hal -- handled by leaving the deergha for the
+    #    virama pass below. The few genuine long-e cases across two consonants
+    #    (දෙපාර්තමේන්තුව, පාර්ලිමේන්තුව) are pinned by wordfixes instead.
     text = _re.sub("\u0dd9" + C, lambda m: m.group(1) + "\u0dd9", text)
     #    ෛ C          -> C ෛ
     text = _re.sub("\u0ddb" + C, lambda m: m.group(1) + "\u0ddb", text)
 
-    # 2) any DEERGHA still standing is an al-lakuna / virama
+    # 2) independent vowel + deergha/au  ->  the long independent vowel
+    text = text.replace("\u0d91" + DEERGHA, "\u0d92")   # එ + a  -> ඒ
+    text = text.replace("\u0d94" + DEERGHA, "\u0d95")   # ඔ + a  -> ඕ
+    text = text.replace("\u0d8b" + AU, "\u0d8c")         # උ + !  -> ඌ
+    text = text.replace("\u0d94" + AU, "\u0d96")         # ඔ + !  -> ඖ
+
+    # 3) resolve leftover sentinels
+    #    a stray AU with no host -> the (rare) standalone gayanukitta sign
+    text = text.replace(AU, "\u0ddf")
+    #    a DEERGHA at the very start has no host consonant -> drop it;
+    #    otherwise it is an al-lakuna / virama
+    if text.startswith(DEERGHA):
+        text = text[len(DEERGHA):]
     text = text.replace(DEERGHA, "\u0dca")
 
     return text
