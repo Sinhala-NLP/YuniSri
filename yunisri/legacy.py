@@ -206,6 +206,19 @@ FM_MAP.update({
     "\u00e3": "ඩ",                 # ã  -> ඩ    (name initial "D")
     "\u00e6": "!",                 # æ  -> !    (වේවා!)
     "+":      "\u0dd6",            # +  -> ූ    (අනුකූල, භූගත, කූප)  [FM runs]
+
+    # ---- NEW FIXES FOR THE REPORTED ARTIFACTS ----
+    # Punctuation
+    "²": "•",                      # bullet point
+    "^": "(",                      # open parenthesis
+    "&": ")",                      # close parenthesis
+
+    # Byte '|' represents the consonant ඳ (used in සඳහා)
+    "|": "ඳ",
+
+    # The specific case of කෙ|් -> කේ (drop the stray ඳ)
+    # In legacy bytes: l (ක) + f (ෙ) + | + a (්)
+    "lf|a": "කේ",
 })
 
 
