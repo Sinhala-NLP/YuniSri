@@ -72,7 +72,12 @@ try:                               # legacy FM/DL simple-font recovery (mode 2)
 except ImportError:                # running as a bare script
     import legacy as _legacy
 
-__all__ = ["fix_pdf", "build_map", "apply_map", "apply_legacy"]
+try:                               # 2006 GDI/MSTT high-byte fonts (mode 3)
+    from . import gdi as _gdi
+except ImportError:
+    import gdi as _gdi
+
+__all__ = ["fix_pdf", "build_map", "apply_map", "apply_legacy", "apply_gdi"]
 
 
 # -----------------------------------------------------------------------------
@@ -1042,6 +1047,157 @@ def apply_legacy(pdf, overrides=None, wordfixes=None, actualtext=True, verbose=F
 
 
 # -----------------------------------------------------------------------------
+# GDI/MSTT simple-font recovery   (recovery mode 3)
+# -----------------------------------------------------------------------------
+# 2006-era Hansard PDFs: subsetted /Type1 fonts (BaseFont like "MSTT31c3d8")
+# with a custom /Differences encoding of code-named glyphs (/G7F ...) and NO
+# /ToUnicode. No cmap/GSUB/uni-names, so they can't self-recover; recovery is a
+# byte->Unicode table + the FM reorder (see gdi.py). We only touch runs this
+# table actually resolves, so Tamil / bold MSTT faces are left untouched.
+_GDI_MIN_COVERAGE = 0.6      # a run must be >=60% resolvable to be rewritten
+
+def font_is_gdi_simple(f):
+    """True for a Windows-GDI 'MSTTxxxx' subset font: a simple Type1/TrueType
+    font with no /ToUnicode and a custom encoding (the byte->Unicode table in
+    gdi.py plus the per-run coverage guard decide what actually gets rewritten,
+    so this can be permissive without risking non-Sinhala fonts)."""
+    if str(f.get("/Subtype")) not in ("/TrueType", "/Type1"):
+        return False
+    if "/ToUnicode" in f:
+        return False
+    base = str(f.get("/BaseFont", ""))
+    if "MSTT" in base:
+        return True
+    enc = f.get("/Encoding")
+    if isinstance(enc, pikepdf.Dictionary) and "/Differences" in enc:
+        for x in enc["/Differences"]:
+            if not isinstance(x, int) and str(x).startswith("/G"):
+                return True
+    return False
+
+def _gdi_run_bytes(instr, op):
+    """A show op's raw bytes plus spaces for big TJ inter-word gaps (as text)."""
+    parts = []
+    def emit(b):
+        parts.append(_gdi.transliterate(b))
+    if op == "Tj":
+        emit(bytes(instr.operands[0]))
+    else:
+        for el in instr.operands[0]:
+            if isinstance(el, pikepdf.String):
+                emit(bytes(el))
+            elif float(el) < -_GAP_THOUSANDTHS:
+                parts.append(" ")
+    return "".join(parts)
+
+def _gdi_raw_bytes(instr, op):
+    b = b""
+    if op == "Tj":
+        b = bytes(instr.operands[0])
+    else:
+        for el in instr.operands[0]:
+            if isinstance(el, pikepdf.String):
+                b += bytes(el)
+    return b
+
+def _inject_actualtext_gdi_page(page, gdi_bases, wordfixes=None):
+    res = page.get("/Resources"); fonts = (res or {}).get("/Font", {})
+    nb = {str(n): str(ff.get("/BaseFont", "")) for n, ff in (fonts.items() if fonts else [])}
+    isg = {str(n): font_is_gdi_simple(ff) for n, ff in (fonts.items() if fonts else [])}
+    try:
+        ops = list(pikepdf.parse_content_stream(page))
+    except Exception:
+        return
+    cur = None; out = []; changed = False
+    for instr in ops:
+        o = str(instr.operator)
+        if o == "Tf":
+            cur = str(instr.operands[0]); out.append(instr); continue
+        if o in ("Tj", "TJ") and isg.get(cur) and nb.get(cur) in gdi_bases:
+            raw = _gdi_raw_bytes(instr, o)
+            if raw.strip() and _gdi.coverage(raw) >= _GDI_MIN_COVERAGE:
+                text = _gdi_run_bytes(instr, o)
+                text = _apply_wordfixes(text, wordfixes)
+                if text:
+                    props = Dictionary(ActualText=String(text))
+                    out.append(ContentStreamInstruction([Name("/Span"), props], Operator("BDC")))
+                    out.append(instr)
+                    out.append(ContentStreamInstruction([], Operator("EMC")))
+                    changed = True; continue
+        out.append(instr)
+    if changed:
+        page.Contents.write(pikepdf.unparse_content_stream(out))
+
+def apply_gdi(pdf, wordfixes=None, actualtext=True, verbose=False):
+    """Recover text from 2006 GDI/MSTT subset fonts, in place. Returns the number
+    of such fonts whose runs were rewritten (0 if none apply).
+
+    The gdi.py table is validated for the Sinhala MSTT face only. The Tamil and
+    bold MSTT faces in the same documents reuse the same byte codes, so a byte-
+    coverage test can't tell them apart -- decoding Tamil with the Sinhala table
+    yields Sinhala-looking junk. So a font qualifies only if its *decoded* text
+    actually reads as Sinhala (hits several common Sinhala words); everything
+    else is left untouched."""
+    # accumulate each candidate font's decoded text, then keep only the ones
+    # that read as Sinhala.
+    per_font = {}
+    for page in pdf.pages:
+        res = page.get("/Resources"); fonts = (res or {}).get("/Font", {})
+        nb = {str(n): str(ff.get("/BaseFont", "")) for n, ff in (fonts.items() if fonts else [])}
+        isg = {str(n): font_is_gdi_simple(ff) for n, ff in (fonts.items() if fonts else [])}
+        cur = None
+        try:
+            ops = list(pikepdf.parse_content_stream(page))
+        except Exception:
+            continue
+        for instr in ops:
+            o = str(instr.operator)
+            if o == "Tf":
+                cur = str(instr.operands[0])
+            elif o in ("Tj", "TJ") and isg.get(cur):
+                raw = _gdi_raw_bytes(instr, o)
+                if raw.strip() and _gdi.coverage(raw) >= _GDI_MIN_COVERAGE:
+                    per_font.setdefault(nb.get(cur), []).append(_gdi.transliterate(raw))
+
+    qualifying = {b for b, chunks in per_font.items()
+                  if b and _text_reads_as_sinhala("".join(chunks))}
+    if not qualifying:
+        return 0
+    if verbose:
+        print("GDI/MSTT Sinhala fonts recovered: "
+              + ", ".join(sorted(_fontname(b) for b in qualifying if b)))
+    if actualtext:
+        for page in pdf.pages:
+            _inject_actualtext_gdi_page(page, qualifying, wordfixes)
+    return len(qualifying)
+
+# Real Sinhala decoded with the gdi.py table has almost no replacement chars and
+# its dependent marks nearly always follow a consonant; Tamil/bold faces decoded
+# with the same table use many bytes the table lacks (-> replacement chars) and
+# produce ill-formed mark sequences. These thresholds separate the two cleanly.
+_GDI_MAX_REPL = 0.12
+_GDI_MIN_MARKFRAC = 0.55
+_SINH_CONS = "\u0d9a-\u0dc6"
+_SINH_MARK = "\u0dca-\u0ddf\u0d82\u0d83"
+_RE_MARK = _re.compile("[" + _SINH_MARK + "]")
+_RE_GOODMARK = _re.compile("(?<=[" + _SINH_CONS + "\u200d])[" + _SINH_MARK + "]")
+
+def _text_reads_as_sinhala(text):
+    """True if decoded text is really Sinhala (not Tamil/bold via the wrong
+    table): few replacement chars, enough Sinhala letters, and dependent marks
+    that mostly sit on a consonant."""
+    sinh = sum(1 for c in text if "\u0d80" <= c <= "\u0dff")
+    if sinh < 4:
+        return False
+    if text.count("\ufffd") / max(len(text), 1) > _GDI_MAX_REPL:
+        return False
+    marks = _RE_MARK.findall(text)
+    if marks and len(_RE_GOODMARK.findall(text)) / len(marks) < _GDI_MIN_MARKFRAC:
+        return False
+    return True
+
+
+# -----------------------------------------------------------------------------
 # PUBLIC API  --  the one call most users need
 # -----------------------------------------------------------------------------
 def fix_pdf(input_pdf, output_pdf="output.pdf", *,
@@ -1121,7 +1277,10 @@ def fix_pdf(input_pdf, output_pdf="output.pdf", *,
     n_legacy = apply_legacy(pdf, overrides=legacy_overrides, wordfixes=wordfixes,
                             actualtext=actualtext, verbose=verbose)
 
-    if verbose and not has_type0 and not n_legacy:
+    # --- mode 3: 2006 GDI/MSTT high-byte simple-font recovery ------------------
+    n_gdi = apply_gdi(pdf, wordfixes=wordfixes, actualtext=actualtext, verbose=verbose)
+
+    if verbose and not has_type0 and not n_legacy and not n_gdi:
         print("No recoverable Sinhala/Tamil fonts found; output equals input.")
 
     pdf.save(output_pdf)
