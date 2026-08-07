@@ -344,7 +344,11 @@ def _reference_signatures(ttf):
 
 def _reverse_cmap(ttf):
     rev = defaultdict(list)
-    for uni, gname in ttf.getBestCmap().items():
+    try:
+        cmap = ttf.getBestCmap()
+    except Exception:
+        cmap = None
+    for uni, gname in (cmap or {}).items():
         rev[gname].append(uni)
     return rev
 
