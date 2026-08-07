@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "yunisri"
-version = "0.2.1"
+version = "0.2.2"
 description = "Make broken-encoding Sri-Lankan (Sinhala/Tamil) PDFs copy-paste-able without OCR, without changing their appearance."
 readme = "README.md"
 requires-python = ">=3.9"
