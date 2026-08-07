@@ -234,6 +234,16 @@ def font_is_type0_identity(f):
     return (str(f.get("/Subtype")) == "/Type0"
             and str(f.get("/Encoding")) == "/Identity-H")
 
+def _objkey(f):
+    """A stable per-OBJECT key. A single PDF can embed several distinct subsets
+    under the *same* BaseFont name (e.g. two 'ABCDEE+Iskoola Pota' objects with
+    different glyph orders); keying maps by name would let one clobber the other,
+    so we key by the PDF object id instead."""
+    og = getattr(f, "objgen", None)
+    if og and og != (0, 0):
+        return ("obj", int(og[0]), int(og[1]))
+    return ("id", id(f))
+
 
 # -----------------------------------------------------------------------------
 # analyze
@@ -374,15 +384,128 @@ def _reverse_gsub(ttf):
                 continue
     return out
 
+_UNINAME = _re.compile(r"^u(?:ni)?([0-9A-Fa-f]{4,6})$")
+def _unicode_from_glyphname(gname):
+    """Recover Unicode from a glyph NAME (uniXXXX / uXXXXXX / concatenated
+    uniXXXXYYYY ligature names). Subsetters that keep real glyph names leave the
+    Unicode readable here even when the cmap entry was dropped. Returns ''."""
+    m = _UNINAME.match(gname)
+    if m:
+        cp = int(m.group(1), 16)
+        return chr(cp) if cp <= 0x10FFFF else ""
+    if gname.startswith("uni") and len(gname) > 7 and (len(gname) - 3) % 4 == 0:
+        try:
+            return "".join(chr(int(gname[3 + i:7 + i], 16))
+                           for i in range(0, len(gname) - 3, 4))
+        except ValueError:
+            return ""
+    return ""
+
 def _gname_to_unicode(gname, rcmap, rgsub, _depth=0):
     """Resolve a reference glyph name to a Unicode string (may recurse GSUB)."""
     if _depth > 8:
         return ""
+    u = _unicode_from_glyphname(gname)          # try the name itself first
+    if u:
+        return u
     if gname in rcmap:
         return "".join(chr(u) for u in rcmap[gname])
     if gname in rgsub:
         return "".join(_gname_to_unicode(g, rcmap, rgsub, _depth + 1) for g in rgsub[gname])
     return ""   # unknown (e.g. a pure display variant with no Unicode)
+
+
+# -----------------------------------------------------------------------------
+# self-recovery: build {gid: unicode} straight from an EMBEDDED subset, using
+# its own glyph names + cmap + GSUB, with structural inference for the combining
+# marks whose cmap entry the subsetter stripped. This makes Type0/Identity-H
+# files recoverable WITHOUT any external reference fonts.
+# -----------------------------------------------------------------------------
+_SINH_MARKS = (0x0DCA, 0x0DCF, 0x0DD0, 0x0DD1, 0x0DD2, 0x0DD3, 0x0DD4, 0x0DD6,
+               0x0DD8, 0x0DD9, 0x0DDA, 0x0DDB, 0x0DDC, 0x0DDD, 0x0DDE, 0x0DDF)
+_TAM_MARKS  = (0x0BBE, 0x0BBF, 0x0BC0, 0x0BC1, 0x0BC2, 0x0BC6, 0x0BC7, 0x0BC8,
+               0x0BCA, 0x0BCB, 0x0BCC, 0x0BCD)
+
+def _embedded_selfmap(ttf, verbose_tag=None):
+    """{gid: unicode} recovered from the embedded font itself, or {} if the font
+    carries no Sinhala/Tamil signal (caller then relies on reference matching).
+
+    The subsetter keeps glyph names, cmap for base letters, and the full GSUB,
+    but often drops the cmap entries for the dependent vowel signs and ZWJ. Those
+    survive only as opaque leaf glyphs inside GSUB ligatures. We identify them:
+      * ZWJ  -> the unresolved leaf that most often follows the virama in a
+                conjunct component list;
+      * the dependent-vowel leaves -> the remaining post-base unresolved leaves,
+                zipped in glyph-id order onto the cmap-missing marks in codepoint
+                order (Windows' subsetter assigns new gids in codepoint order, so
+                the two line up). Passing real reference fonts resolves these by
+                exact outline instead and is definitive.
+    """
+    from collections import Counter
+    order = ttf.getGlyphOrder()
+    cmap = ttf.getBestCmap() or {}
+    rc = _reverse_cmap(ttf)
+    rgsub = _reverse_gsub(ttf)
+
+    is_sinh = any(0x0D80 <= u <= 0x0DFF for u in cmap)
+    is_tam  = any(0x0B80 <= u <= 0x0BFF for u in cmap)
+    if not (is_sinh or is_tam):
+        return {}
+    virama = "\u0DCA" if is_sinh else "\u0BCD"
+    cand_marks = _SINH_MARKS if is_sinh else _TAM_MARKS
+    missing = sorted(u for u in cand_marks if u not in cmap)
+
+    def named(g):
+        return _unicode_from_glyphname(g)
+    def base_resolvable(g):
+        return bool(named(g)) or g in rc or g in rgsub
+
+    first_pos = set()
+    after_virama = Counter()
+    post_marks = Counter()
+    for comps in rgsub.values():
+        for i, c in enumerate(comps):
+            if base_resolvable(c):
+                continue
+            if i == 0:
+                first_pos.add(c)
+            elif named(comps[i - 1]) == virama:
+                after_virama[c] += 1
+            else:
+                post_marks[c] += 1
+
+    leaf = {}
+    if after_virama:
+        leaf[after_virama.most_common(1)[0][0]] = "\u200d"     # ZWJ
+    vowels = sorted({g for g in post_marks if g not in leaf and g not in first_pos},
+                    key=order.index)
+    for g, u in zip(vowels, missing):
+        leaf[g] = chr(u)
+
+    def resolve(g, depth=0):
+        if depth > 12:
+            return ""
+        if g in leaf:
+            return leaf[g]
+        u = named(g)
+        if u:
+            return u
+        if g in rc:
+            return "".join(chr(x) for x in rc[g])
+        if g in rgsub:
+            return "".join(resolve(x, depth + 1) for x in rgsub[g])
+        return ""
+
+    g2u = {}
+    for gid, gname in enumerate(order):
+        u = resolve(gname)
+        if u:
+            g2u[gid] = u
+    if verbose_tag:
+        print(f"  {verbose_tag}: self-map {len(g2u)}/{len(order)} glyphs "
+              f"(inferred marks: ZWJ={'yes' if after_virama else 'no'}, "
+              f"vowels={len([g for g in leaf if leaf[g]!=chr(0x200d)])})")
+    return g2u
 
 def _find_font_files(paths):
     """Accept dirs and/or individual files; return font file paths.
@@ -442,17 +565,40 @@ def build_map(pdf, refs, verbose=False):
     used = collect_used_cids(pdf)               # {basefont: set(cid)}
     result = {}
 
+    # First pass: load every Type0 subset, compute its embedded self-map, and
+    # index self-mapped glyph OUTLINES so a sibling subset of the SAME font that
+    # had its cmap stripped can still be recovered (same outlines, known Unicode).
+    subs = []
+    sibling_sig = {}
     for base, f in iter_font_objects(pdf):
         if not font_is_type0_identity(f):
             continue
         d = f["/DescendantFonts"][0]
-        fd = d.get("/FontDescriptor", {})
-        ff = fd.get("/FontFile2")
+        ff = d.get("/FontDescriptor", {}).get("/FontFile2")
         if ff is None:
             continue
-        sub = TTFont(io.BytesIO(bytes(ff.read_bytes())))
+        try:
+            sub = TTFont(io.BytesIO(bytes(ff.read_bytes())))
+        except Exception:
+            continue
         if "glyf" not in sub:
             continue
+        selfmap = _embedded_selfmap(sub, verbose_tag=(base[:40] if verbose else None))
+        subs.append((base, f, sub, selfmap))
+        if selfmap:
+            gs = sub.getGlyphSet(); upm = _upm(sub); order = sub.getGlyphOrder()
+            for gid, u in selfmap.items():
+                if not u.strip():
+                    continue
+                try:
+                    sig = _glyph_signature(gs, order[gid], upm)
+                except Exception:
+                    sig = None
+                if sig is not None:
+                    sibling_sig.setdefault(sig, u)
+
+    # Second pass: resolve each font's used glyphs.
+    for base, f, sub, selfmap in subs:
         sub_gs = sub.getGlyphSet()
         sub_upm = _upm(sub)
         order = sub.getGlyphOrder()
@@ -463,23 +609,24 @@ def build_map(pdf, refs, verbose=False):
             if cid >= len(order):
                 continue
             gname = order[cid]
-            try:
-                sig = _glyph_signature(sub_gs, gname, sub_upm)
-            except Exception:
-                sig = None
-            uni = ""
-            if sig is not None:
-                for _, _tt, rsig, rcmap, rgsub in refs:
-                    if sig in rsig:
-                        uni = _gname_to_unicode(rsig[sig], rcmap, rgsub)
-                        if uni:
-                            break
-            else:
-                # Empty-outline glyph: if it advances the pen it is a SPACE.
-                # (Otherwise a zero-width mark -> leave empty.) This is what
-                # keeps words from running together.
-                if _is_blank_space(sub, gname):
-                    uni = " "
+            uni = selfmap.get(cid, "")
+            if not uni:
+                # outline match: reference fonts first (exact, definitive), then
+                # self-mapped sibling subsets of the same font.
+                try:
+                    sig = _glyph_signature(sub_gs, gname, sub_upm)
+                except Exception:
+                    sig = None
+                if sig is not None:
+                    for _, _tt, rsig, rcmap, rgsub in refs:
+                        if sig in rsig:
+                            uni = _gname_to_unicode(rsig[sig], rcmap, rgsub)
+                            if uni:
+                                break
+                    if not uni and sig in sibling_sig:
+                        uni = sibling_sig[sig]
+                elif cid not in selfmap and _is_blank_space(sub, gname):
+                    uni = " "     # blank-outline glyph that advances -> space
             if uni:
                 cid_map[cid] = uni
         if verbose:
@@ -488,7 +635,7 @@ def build_map(pdf, refs, verbose=False):
             total = len(want)
             print(f"{base[:40]:40} matched {matched}/{total} used glyphs"
                   + (f"  (+{spaces} spaces)" if spaces else ""))
-        result[base] = cid_map
+        result[_objkey(f)] = cid_map
     return result
 
 def cmd_buildmap(args):
@@ -496,20 +643,21 @@ def cmd_buildmap(args):
     print(f"Searching for reference fonts in: {', '.join(paths)}")
     refs = _load_reference_fonts(paths)
     if not refs:
-        sys.exit(
-            "No usable reference fonts found.\n"
-            "Point --fonts at a folder containing the ORIGINAL .ttf files, e.g.\n"
-            "  Windows: --fonts C:\\Windows\\Fonts\n"
-            "  or copy just the needed ones into a folder:\n"
-            "     iskpota.ttf iskpotab.ttf  (Iskoola Pota / -Bold, Sinhala)\n"
-            "     latha.ttf   lathab.ttf    (Latha, Tamil)\n"
-            "     arialuni.ttf              (Arial Unicode MS)\n"
-            "     the Dinamina .ttf you have\n"
-            "You can pass a whole dir, several dirs, or individual files.")
+        print("No reference fonts found; building the map from the embedded "
+              "fonts themselves (self-recovery). Pass --fonts to also resolve any "
+              "glyphs the embedded subsets can't name by exact outline.")
 
     pdf = pikepdf.open(args.pdf)
-    result = build_map(pdf, refs, verbose=True)
-    out = {base: {str(k): v for k, v in m.items()} for base, m in result.items()}
+    result = build_map(pdf, refs, verbose=True)          # keyed by object
+    # serialise by BaseFont name for a portable map.json; if a name has several
+    # distinct subsets, keep the richest so the file stays usable.
+    key_to_base = {_objkey(f): base for base, f in iter_font_objects(pdf)
+                   if font_is_type0_identity(f)}
+    out = {}
+    for k, m in result.items():
+        base = key_to_base.get(k, str(k))
+        if len(m) >= len(out.get(base, {})):
+            out[base] = {str(c): v for c, v in m.items()}
     with open(args.out, "w", encoding="utf-8") as fh:
         json.dump(out, fh, ensure_ascii=False, indent=1)
     print(f"\nWrote {args.out}. Any remaining unmatched glyphs are display-only "
@@ -579,39 +727,60 @@ def apply_map(pdf, fmap, fixes=None, wordfixes=None,
                   documents (subset tags differ per file, glyph CIDs are stable).
     `wordfixes` : optional {broken_word: correct_word} whole-word overrides.
     """
-    # normalise map: {basefont: {int cid: str}}
-    fmap = {base: {int(k): v for k, v in m.items()} for base, m in fmap.items()}
+    # Normalise incoming map to be keyed by OBJECT. build_map already returns
+    # per-object keys; an external map.json (from the CLI) is keyed by BaseFont
+    # name, so map each such name onto every object of that name.
+    obj_map = {}          # objkey -> {int cid: str}
+    name_by_key = {}      # objkey -> basefont str
+    by_name_json = {}
+    for k, m in fmap.items():
+        if isinstance(k, str):
+            by_name_json[k] = {int(c): v for c, v in m.items()}
+    for base, f in iter_font_objects(pdf):
+        if not font_is_type0_identity(f):
+            continue
+        k = _objkey(f)
+        name_by_key[k] = base
+        if k in fmap:                                   # per-object (build_map)
+            obj_map[k] = {int(c): v for c, v in fmap[k].items()}
+        elif base in by_name_json:                      # exact name (JSON)
+            obj_map[k] = dict(by_name_json[base])
+        else:                                           # subset-stripped name
+            for nm, jm in by_name_json.items():
+                if _fontname(nm) == _fontname(base):
+                    obj_map[k] = dict(jm); break
 
-    # merge hand-fix overrides (by normalised font name)
+    # merge hand-fix overrides (by normalised font name -> all matching objects)
     if fixes:
         by_name = {}
         for key, m in fixes.items():
             by_name.setdefault(_fontname(key), {}).update({int(k): v for k, v in m.items()})
-        for base, f in iter_font_objects(pdf):
-            if font_is_type0_identity(f) and _fontname(base) in by_name:
-                fmap.setdefault(base, {}).update(by_name[_fontname(base)])
+        for k, base in name_by_key.items():
+            if _fontname(base) in by_name:
+                obj_map.setdefault(k, {}).update(by_name[_fontname(base)])
 
     wordfixes = wordfixes or {}
 
     # Only remap fonts that actually carry Indic script. Latin/symbol fonts
     # (Times, Calibri, Symbol, ...) already have a correct ToUnicode, so leaving
     # them untouched keeps English/numbers copying correctly.
-    skipped = [b for b, m in fmap.items() if not _has_indic(m)]
-    for b in skipped:
-        del fmap[b]
+    skipped = [k for k, m in obj_map.items() if not _has_indic(m)]
+    for k in skipped:
+        del obj_map[k]
     if skipped and verbose:
         print(f"Left {len(skipped)} non-Indic font(s) untouched (their original "
               f"text layer is already correct).")
 
     # 1) rewrite ToUnicode per mapped font (helps tools that ignore ActualText)
     for base, f in iter_font_objects(pdf):
-        if base in fmap and font_is_type0_identity(f):
-            f["/ToUnicode"] = build_tounicode_stream(pdf, fmap[base])
+        k = _objkey(f)
+        if k in obj_map and font_is_type0_identity(f):
+            f["/ToUnicode"] = build_tounicode_stream(pdf, obj_map[k])
 
     # 2) inject ActualText per text-show (fixes ordering; primary path)
     if actualtext:
         for page in pdf.pages:
-            _inject_actualtext_page(page, fmap, wordfixes, sinhala_fix=sinhala_fix)
+            _inject_actualtext_page(page, obj_map, wordfixes, sinhala_fix=sinhala_fix)
 
 def cmd_apply(args):
     with open(args.map, encoding="utf-8") as fh:
@@ -675,11 +844,11 @@ def _apply_wordfixes(text, wordfixes):
         _SINH_TAM_WORD = _re.compile(r"[\u0B80-\u0BFF\u0D80-\u0DFF\u200d]+")
     return _SINH_TAM_WORD.sub(lambda m: wordfixes.get(m.group(0), m.group(0)), text)
 
-def _inject_actualtext_page(page, fmap, wordfixes=None, sinhala_fix=True):
+def _inject_actualtext_page(page, obj_map, wordfixes=None, sinhala_fix=True):
     res = page.get("/Resources")
     fonts = (res or {}).get("/Font", {})
-    name_to_base = {str(n): str(ff.get("/BaseFont", "")) for n, ff in
-                    (fonts.items() if fonts else [])}
+    name_to_key = {str(n): _objkey(ff) for n, ff in
+                   (fonts.items() if fonts else [])}
     name_to_two = {str(n): font_is_type0_identity(ff) for n, ff in
                    (fonts.items() if fonts else [])}
     try:
@@ -694,14 +863,15 @@ def _inject_actualtext_page(page, fmap, wordfixes=None, sinhala_fix=True):
         if op == "Tf":
             cur = str(instr.operands[0])
             out.append(instr); continue
-        if op in ("Tj", "TJ") and cur in name_to_base and name_to_two.get(cur) \
-           and name_to_base[cur] in fmap:
-            m = fmap[name_to_base[cur]]
+        if op in ("Tj", "TJ") and name_to_two.get(cur) \
+           and name_to_key.get(cur) in obj_map:
+            m = obj_map[name_to_key[cur]]
             text = _run_text_with_spaces(instr, op, m)
             text = reorder_logical(text)
             text = _apply_wordfixes(text, wordfixes)   # explicit dictionary first
             if sinhala_fix:
                 text = _fix_sinhala_vowels(text)        # then generic repair
+                text = _apply_wordfixes(text, wordfixes)  # catch final-form keys
             if text:
                 props = Dictionary(ActualText=String(text))
                 out.append(ContentStreamInstruction([Name("/Span"), props], Operator("BDC")))
@@ -930,10 +1100,15 @@ def fix_pdf(input_pdf, output_pdf="output.pdf", *,
         else:
             paths = [fonts_dir]
         refs = _load_reference_fonts(paths, verbose=verbose)
-        if not refs:
-            raise RuntimeError(
-                f"No usable reference fonts found in {paths!r}. "
-                "Ensure the package's fonts/ folder is installed, or pass fonts_dir=.")
+        # Reference fonts are now OPTIONAL: most Type0 files can be recovered
+        # from the embedded subset itself (glyph names + cmap + GSUB, with
+        # structural inference for stripped combining marks). Reference fonts,
+        # when available, only fill glyphs the embedded font can't name and are
+        # resolved by exact outline. So we no longer hard-fail without them.
+        if not refs and verbose:
+            print("No reference fonts found; recovering from the embedded fonts "
+                  "themselves. Pass fonts_dir= (e.g. C:\\Windows\\Fonts) to resolve "
+                  "any glyphs the embedded subset can't name by exact outline.")
         fmap = build_map(pdf, refs, verbose=verbose)
         apply_map(pdf, fmap, fixes=fixes, wordfixes=wordfixes,
                   sinhala_fix=sinhala_heuristics, actualtext=actualtext, verbose=verbose)
